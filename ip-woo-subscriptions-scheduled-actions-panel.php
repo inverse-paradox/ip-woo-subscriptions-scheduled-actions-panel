@@ -501,9 +501,16 @@ class IP_WooSubs_Scheduled_Actions_Panel {
 		}
 
 		// Don't offer re-scheduling a renewal payment when the subscription already
-		// has an unpaid renewal order awaiting payment — scheduling another action
-		// would create a duplicate charge attempt.
+		// has an unpaid order awaiting payment (renewal or parent) — scheduling
+		// another action would create a duplicate charge attempt.
 		if ( 'woocommerce_scheduled_subscription_payment' === $hook ) {
+			// Check the parent (initial) order first.
+			$parent_order = $subscription->get_parent();
+			if ( $parent_order && $parent_order->needs_payment() ) {
+				return null;
+			}
+
+			// Then check any renewal orders.
 			$renewal_order_ids = $subscription->get_related_orders( 'ids', 'renewal' );
 			foreach ( $renewal_order_ids as $order_id ) {
 				$order = wc_get_order( $order_id );
