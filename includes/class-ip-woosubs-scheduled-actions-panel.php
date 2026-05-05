@@ -47,6 +47,11 @@ class IP_WooSubs_Scheduled_Actions_Panel {
 
 		add_action( 'admin_post_ip_wsap_schedule_action', array( $this, 'handle_schedule_action' ) );
 		add_action( 'admin_notices', array( $this, 'maybe_display_notice' ) );
+
+		if ( defined( 'WP_CLI' ) && WP_CLI ) {
+			$cli = new IP_WooSubs_CLI( $this );
+			$cli->register_commands();
+		}
 	}
 
 	// -------------------------------------------------------------------------
