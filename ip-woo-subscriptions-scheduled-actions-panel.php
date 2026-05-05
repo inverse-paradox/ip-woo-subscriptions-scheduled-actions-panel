@@ -165,7 +165,7 @@ class IP_WooSubs_Scheduled_Actions_Panel {
 		$display = null !== $active ? $active : $most_recent;
 
 		echo '<div class="ip-wsap__row">';
-		echo '<span class="ip-wsap__label">' . esc_html( $label ) . '</span>';
+		echo '<span class="ip-wsap__label" title="' . esc_attr( $hook ) . '">' . esc_html( $label ) . '</span>';
 
 		if ( null !== $display ) {
 			$this->render_action_badge( $display );
@@ -493,6 +493,26 @@ class IP_WooSubs_Scheduled_Actions_Panel {
 	 * @return array{url: string, is_past: bool}|null
 	 */
 	private function get_schedule_link_url( $hook, $subscription_id, $subscription ) {
+		// Don't offer scheduling on terminal statuses — the subscription is no
+		// longer active and re-scheduling its actions would be misleading.
+		$terminal_statuses = array( 'cancelled', 'expired', 'switched', 'trash' );
+		if ( in_array( $subscription->get_status(), $terminal_statuses, true ) ) {
+			return null;
+		}
+
+		// Don't offer re-scheduling a renewal payment when the subscription already
+		// has an unpaid renewal order awaiting payment — scheduling another action
+		// would create a duplicate charge attempt.
+		if ( 'woocommerce_scheduled_subscription_payment' === $hook ) {
+			$renewal_order_ids = $subscription->get_related_orders( 'ids', 'renewal' );
+			foreach ( $renewal_order_ids as $order_id ) {
+				$order = wc_get_order( $order_id );
+				if ( $order && $order->needs_payment() ) {
+					return null;
+				}
+			}
+		}
+
 		$schedulable = $this->get_schedulable_hook_date_keys();
 
 		if ( ! isset( $schedulable[ $hook ] ) ) {
