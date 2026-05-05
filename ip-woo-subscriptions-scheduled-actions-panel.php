@@ -3,7 +3,7 @@
  * Plugin Name: IP WooCommerce Subscriptions Scheduled Actions Panel
  * Plugin URI : https://www.inverseparadox.com
  * Description: Adds a panel to the WooCommerce Subscriptions editor admin to display information on scheduled actions for the subscription.
- * Version:     1.0.0
+ * Version:     1.1.0
  * Author:      Inverse Paradox
  * Author URI:  https://inverseparadox.com
  * Text Domain: ip-woosubs-sched-actions-panel
@@ -52,6 +52,8 @@ class IP_WooSubs_Scheduled_Actions_Panel {
 	 */
 	private function __construct() {
 		add_action( 'add_meta_boxes', array( $this, 'register_meta_box' ) );
+		add_action( 'admin_post_ip_wsap_schedule_action', array( $this, 'handle_schedule_action' ) );
+		add_action( 'admin_notices', array( $this, 'maybe_display_notice' ) );
 	}
 
 	// -------------------------------------------------------------------------
@@ -112,10 +114,12 @@ class IP_WooSubs_Scheduled_Actions_Panel {
 			return;
 		}
 
+		$subscription = function_exists( 'wcs_get_subscription' ) ? wcs_get_subscription( $subscription_id ) : null;
+
 		echo '<div class="ip-wsap">';
 
 		foreach ( $this->get_subscription_hooks() as $hook => $label ) {
-			$this->render_hook_row( $hook, $label, $subscription_id );
+			$this->render_hook_row( $hook, $label, $subscription_id, $subscription );
 		}
 
 		$as_url = $this->get_action_scheduler_search_url( $subscription_id );
@@ -136,11 +140,12 @@ class IP_WooSubs_Scheduled_Actions_Panel {
 	 * Prioritises any active (pending/running) action; falls back to the most
 	 * recently scheduled action so historical context is always visible.
 	 *
-	 * @param string $hook            Action Scheduler hook name.
-	 * @param string $label           Human-readable label for the hook.
-	 * @param int    $subscription_id Subscription post ID.
+	 * @param string               $hook            Action Scheduler hook name.
+	 * @param string               $label           Human-readable label for the hook.
+	 * @param int                  $subscription_id Subscription post ID.
+	 * @param WC_Subscription|null $subscription    Subscription object, or null if unavailable.
 	 */
-	private function render_hook_row( $hook, $label, $subscription_id ) {
+	private function render_hook_row( $hook, $label, $subscription_id, $subscription = null ) {
 		$actions     = $this->get_actions_for_hook( $hook, $subscription_id );
 		$active      = null;
 		$most_recent = null;
@@ -166,6 +171,24 @@ class IP_WooSubs_Scheduled_Actions_Panel {
 			$this->render_action_badge( $display );
 		} else {
 			echo '<span class="ip-wsap__badge ip-wsap__badge--none">' . esc_html__( 'Not scheduled', 'ip-woosubs-sched-actions-panel' ) . '</span>';
+		}
+
+		// Show a schedule link when no active (pending/running) action exists.
+		if ( null === $active && null !== $subscription ) {
+			$schedule = $this->get_schedule_link_url( $hook, $subscription_id, $subscription );
+			if ( $schedule ) {
+				$onclick = '';
+				if ( $schedule['is_past'] ) {
+					$confirm_msg = __( 'The scheduled date for this action is in the past. The action will be queued and run immediately on the next Action Scheduler pass. Continue?', 'ip-woosubs-sched-actions-panel' );
+					$onclick     = ' onclick="return confirm(' . esc_attr( wp_json_encode( $confirm_msg ) ) . ')"';
+				}
+				printf(
+					' <a href="%s" class="ip-wsap__schedule-link"%s>%s</a>',
+					esc_url( $schedule['url'] ),
+					$onclick, // Already escaped above.
+					esc_html__( 'Schedule', 'ip-woosubs-sched-actions-panel' )
+				);
+			}
 		}
 
 		echo '</div>';
@@ -198,6 +221,112 @@ class IP_WooSubs_Scheduled_Actions_Panel {
 		if ( $date_string ) {
 			echo ' <span class="ip-wsap__date">' . esc_html( $date_string ) . '</span>';
 		}
+	}
+
+	// -------------------------------------------------------------------------
+	// Action scheduling handler
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Handles the admin-post request to manually schedule a single subscription action.
+	 *
+	 * Validates the nonce, capability, hook allowlist, and that the subscription
+	 * has a future date before scheduling via Action Scheduler.
+	 */
+	public function handle_schedule_action() {
+		$hook            = isset( $_GET['hook'] ) ? sanitize_text_field( wp_unslash( $_GET['hook'] ) ) : '';
+		$subscription_id = isset( $_GET['subscription_id'] ) ? absint( $_GET['subscription_id'] ) : 0;
+
+		if ( ! current_user_can( 'manage_woocommerce' ) ) {
+			wp_die( esc_html__( 'You do not have permission to perform this action.', 'ip-woosubs-sched-actions-panel' ) );
+		}
+
+		check_admin_referer( 'ip_wsap_schedule_' . $hook . '_' . $subscription_id );
+
+		$redirect = wp_get_referer() ? wp_get_referer() : admin_url();
+
+		// Validate the hook is one we explicitly support for manual scheduling.
+		$schedulable = $this->get_schedulable_hook_date_keys();
+		if ( ! isset( $schedulable[ $hook ] ) ) {
+			wp_die( esc_html__( 'This hook cannot be manually scheduled.', 'ip-woosubs-sched-actions-panel' ) );
+		}
+
+		if ( ! $subscription_id ) {
+			wp_die( esc_html__( 'Invalid subscription ID.', 'ip-woosubs-sched-actions-panel' ) );
+		}
+
+		// Bail if a pending action already exists (double-click guard).
+		$existing_ids = as_get_scheduled_actions(
+			array(
+				'hook'     => $hook,
+				'args'     => array( 'subscription_id' => $subscription_id ),
+				'status'   => ActionScheduler_Store::STATUS_PENDING,
+				'per_page' => 1,
+			),
+			'ids'
+		);
+
+		if ( ! empty( $existing_ids ) ) {
+			wp_safe_redirect( add_query_arg( 'ip_wsap_notice', 'already_scheduled', $redirect ) );
+			exit;
+		}
+
+		$subscription = function_exists( 'wcs_get_subscription' ) ? wcs_get_subscription( $subscription_id ) : null;
+		if ( ! $subscription ) {
+			wp_die( esc_html__( 'Subscription not found.', 'ip-woosubs-sched-actions-panel' ) );
+		}
+
+		$timestamp = $subscription->get_time( $schedulable[ $hook ] );
+		if ( ! $timestamp ) {
+			wp_safe_redirect( add_query_arg( 'ip_wsap_notice', 'no_date', $redirect ) );
+			exit;
+		}
+
+		as_schedule_single_action(
+			$timestamp,
+			$hook,
+			array( 'subscription_id' => $subscription_id ),
+			'woocommerce-subscriptions'
+		);
+
+		wp_safe_redirect( add_query_arg( 'ip_wsap_notice', 'scheduled', $redirect ) );
+		exit;
+	}
+
+	/**
+	 * Displays an admin notice after a schedule action redirect.
+	 */
+	public function maybe_display_notice() {
+		if ( empty( $_GET['ip_wsap_notice'] ) ) {
+			return;
+		}
+
+		$notice = sanitize_key( $_GET['ip_wsap_notice'] );
+		$map    = array(
+			'scheduled'         => array(
+				'type' => 'success',
+				'msg'  => __( 'Scheduled action created successfully.', 'ip-woosubs-sched-actions-panel' ),
+			),
+			'already_scheduled' => array(
+				'type' => 'info',
+				'msg'  => __( 'A pending action already exists for this hook.', 'ip-woosubs-sched-actions-panel' ),
+			),
+			'no_date'           => array(
+				'type' => 'warning',
+				'msg'  => __( 'No date is set on the subscription for this action; nothing was scheduled.', 'ip-woosubs-sched-actions-panel' ),
+			),
+		);
+
+		if ( ! isset( $map[ $notice ] ) ) {
+			return;
+		}
+
+		$data = $map[ $notice ];
+		printf(
+			'<div class="notice notice-%s is-dismissible"><p>%s</p></div>',
+			esc_attr( $data['type'] ),
+			esc_html( $data['msg'] )
+		);
 	}
 
 	// -------------------------------------------------------------------------
@@ -332,6 +461,65 @@ class IP_WooSubs_Scheduled_Actions_Panel {
 		);
 	}
 
+	/**
+	 * Returns the hooks that support manual scheduling, mapped to the
+	 * WC_Subscription date key used to determine the timestamp.
+	 *
+	 * Notification and retry hooks are excluded because their schedule
+	 * offsets are managed internally by WooCommerce Subscriptions.
+	 *
+	 * @return array<string, string> Hook => subscription date key.
+	 */
+	private function get_schedulable_hook_date_keys() {
+		return array(
+			'woocommerce_scheduled_subscription_payment'             => 'next_payment',
+			'woocommerce_scheduled_subscription_trial_end'           => 'trial_end',
+			'woocommerce_scheduled_subscription_expiration'          => 'end',
+			'woocommerce_scheduled_subscription_end_of_prepaid_term' => 'end',
+		);
+	}
+
+	/**
+	 * Returns an array describing the schedule link for a given hook, or null if
+	 * the hook is not schedulable or has no date set on the subscription.
+	 *
+	 * Return shape:
+	 *   'url'     => string  Nonce-protected admin-post URL.
+	 *   'is_past' => bool    True when the subscription date is already in the past.
+	 *
+	 * @param string          $hook            Action Scheduler hook name.
+	 * @param int             $subscription_id Subscription post ID.
+	 * @param WC_Subscription $subscription    Subscription object.
+	 * @return array{url: string, is_past: bool}|null
+	 */
+	private function get_schedule_link_url( $hook, $subscription_id, $subscription ) {
+		$schedulable = $this->get_schedulable_hook_date_keys();
+
+		if ( ! isset( $schedulable[ $hook ] ) ) {
+			return null;
+		}
+
+		$timestamp = $subscription->get_time( $schedulable[ $hook ] );
+		if ( ! $timestamp ) {
+			return null;
+		}
+
+		return array(
+			'url'     => wp_nonce_url(
+				add_query_arg(
+					array(
+						'action'          => 'ip_wsap_schedule_action',
+						'subscription_id' => absint( $subscription_id ),
+						'hook'            => $hook,
+					),
+					admin_url( 'admin-post.php' )
+				),
+				'ip_wsap_schedule_' . $hook . '_' . $subscription_id
+			),
+			'is_past' => $timestamp < time(),
+		);
+	}
+
 	// -------------------------------------------------------------------------
 	// HPOS helpers
 	// -------------------------------------------------------------------------
@@ -423,6 +611,14 @@ class IP_WooSubs_Scheduled_Actions_Panel {
 			}
 
 			.ip-wsap__date { font-size: 11px; color: #646970; }
+
+			.ip-wsap__schedule-link {
+				font-size: 11px;
+				text-decoration: none;
+				color: #0073aa;
+				margin-left: 2px;
+			}
+			.ip-wsap__schedule-link:hover { text-decoration: underline; }
 
 			.ip-wsap__footer {
 				margin: 8px 0 0;
